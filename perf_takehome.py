@@ -277,11 +277,11 @@ class KernelBuilder:
         idx_branch_mode: str = "flow_vselect",
         trace_phase_tags: bool = False,
         scheduler_profile: bool = False,
-        scheduler_crit_weight: int = 136,
+        scheduler_crit_weight: int = 112,
         scheduler_engine_bias: dict[str, int] | None = None,
         split_hash_pairs: bool = True,
-        scheduler_succ_weight: int = 3584,
-        scheduler_random_seed: int | None = 707,
+        scheduler_succ_weight: int = 4096,
+        scheduler_random_seed: int | None = 111,
         scheduler_multi_start_seeds: tuple[int, ...] | list[int] | None = None,
         scheduler_beam_width: int = 1,
         fast_value_vector_ptrs: bool = True,
@@ -1476,12 +1476,28 @@ class KernelBuilder:
                 if use_compact_path_depth3plus and depth >= 3:
                     body.append(
                         (
-                            "valu",
-                            ("+", vec_addr, vec_forest_depth_bases[depth], vec_idx),
+                            "alu",
+                            [
+                                (
+                                    "+",
+                                    vec_addr + vi,
+                                    vec_forest_depth_bases[depth] + vi,
+                                    vec_idx + vi,
+                                )
+                                for vi in range(VLEN)
+                            ],
                         )
                     )
                 else:
-                    body.append(("valu", ("+", vec_addr, vec_forest_base, vec_idx)))
+                    body.append(
+                        (
+                            "alu",
+                            [
+                                ("+", vec_addr + vi, vec_forest_base + vi, vec_idx + vi)
+                                for vi in range(VLEN)
+                            ],
+                        )
+                    )
                 for offset in range(VLEN):
                     body.append(("load", ("load_offset", vec_node_val, vec_addr, offset)))
                 body.append(
