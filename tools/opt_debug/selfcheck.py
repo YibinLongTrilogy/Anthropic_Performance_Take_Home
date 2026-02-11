@@ -12,7 +12,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from perf_takehome import do_kernel_test
 from tools.opt_debug.analyze_schedule import analyze_schedule_artifacts
+from tools.opt_debug.compare_inefficiency import compare_inefficiency_reports
 from tools.opt_debug.inefficiency_report import analyze_inefficiency_report
+from tools.opt_debug.lifetime_report import analyze_scratch_lifetime_report
+from tools.opt_debug.scheduler_decision_report import analyze_scheduler_decision_report
 
 
 def run() -> None:
@@ -75,6 +78,50 @@ def run() -> None:
     assert ineff_report["summary"]["segment_count"] == 1
     assert ineff_report["summary"]["combined_lower_bound_cycles"] == 2
     assert len(ineff_report["scratch_hotspots"]) >= 1
+
+    # Check 1c: scheduler decision report reads decision trace rows and aggregates rejections.
+    synthetic_decision_profile = {
+        "segments": [
+            {
+                "phase": "segment:0",
+                "ops": synthetic_profile["segments"][0]["ops"],
+                "cycle_engine_counts": [{"valu": 1}, {"load": 1}],
+                "decision_trace": [
+                    {
+                        "cycle": 0,
+                        "sampled_ops": 2,
+                        "feasible_not_chosen": 1,
+                        "rejections": {"beam_choice": 1},
+                        "used_slots": {"valu": 1},
+                        "feasible_not_chosen_ops": [{"op_id": 1, "engine": "load"}],
+                    },
+                    {
+                        "cycle": 1,
+                        "sampled_ops": 1,
+                        "feasible_not_chosen": 0,
+                        "rejections": {},
+                        "used_slots": {"load": 1},
+                        "feasible_not_chosen_ops": [],
+                    },
+                ],
+            }
+        ]
+    }
+    decision_report = analyze_scheduler_decision_report(synthetic_decision_profile)
+    assert decision_report["summary"]["decision_cycles"] == 2
+    assert decision_report["summary"]["feasible_not_chosen"] == 1
+
+    # Check 1d: lifetime report produces pressure rows and split candidates from schedule profile.
+    lifetime_report = analyze_scratch_lifetime_report(
+        synthetic_profile,
+        scratch_map={1: ("tmp", 1), 2: ("a", 1), 3: ("b", 1), 4: ("out", 1)},
+    )
+    assert lifetime_report["summary"]["address_count"] >= 1
+    assert len(lifetime_report["top_lifetimes"]) >= 1
+
+    # Check 1e: diff report can compare inefficiency payloads.
+    diff_report = compare_inefficiency_reports(ineff_report, ineff_report)
+    assert diff_report["summary"]["cycle_delta"] == 0
 
     # Check 2: kernel run can emit diagnostics artifacts and preserve expected cycles.
     if args.out_dir:

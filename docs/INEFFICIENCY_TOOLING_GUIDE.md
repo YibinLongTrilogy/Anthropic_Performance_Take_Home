@@ -4,11 +4,16 @@ This guide explains how to use the new dependency-focused debugging tool:
 
 - Runner: `tools/opt_debug/run_inefficiency_report.py`
 - Analyzer: `tools/opt_debug/inefficiency_report.py`
+- Scheduler decision runner: `tools/opt_debug/run_scheduler_decision_report.py`
+- Scratch lifetime runner: `tools/opt_debug/run_lifetime_report.py`
+- Diff runner: `tools/opt_debug/run_compare_inefficiency.py`
 
 It is designed to answer:
 - Where are cycles going?
 - Are we blocked by dependency chains, slot limits, or scheduler choices?
 - Which scratch locations create the most schedule pressure?
+- Which scheduler choices skip feasible ready work?
+- Which scratch values stay live too long and overlap heavily?
 
 ## Quick Start
 
@@ -30,6 +35,72 @@ It also prints a compact JSON summary with:
 - `correct`
 - `estimated_headroom_cycles`
 - `top_blockers`
+
+## Additional Reports
+
+### Scheduler Decision Trace Report
+
+Use this when you want to understand where scheduler heuristics are leaving cycles on the table.
+
+```bash
+python tools/opt_debug/run_scheduler_decision_report.py \
+  --kernel-kwargs-json '{"scheduler_beam_width": 2}' \
+  --out-dir docs/reports/optimizations/debug
+```
+
+Writes:
+
+- `latest_scheduler_decisions.json`
+- `latest_scheduler_decisions.md`
+
+Key fields:
+
+- `feasible_not_chosen_pct`
+- `global_rejections` (`beam_choice`, `slot_fragmentation`, `strict_dep_wait`, ...)
+- `top_skipped_patterns` (engine/opcode combinations repeatedly skipped)
+
+### Scratch Lifetime Report
+
+Use this to find long-lived temporaries that constrain reordering freedom.
+
+```bash
+python tools/opt_debug/run_lifetime_report.py \
+  --out-dir docs/reports/optimizations/debug
+```
+
+Writes:
+
+- `latest_lifetimes.json`
+- `latest_lifetimes.md`
+
+Key fields:
+
+- `max_live_overlap`
+- `top_lifetimes` (ranked by pressure score)
+- `split_candidates` with overlap partners
+
+### Inefficiency Diff Report
+
+Use this after an optimization change to compare baseline vs candidate behavior.
+
+```bash
+python tools/opt_debug/run_compare_inefficiency.py \
+  --base-json docs/reports/optimizations/debug/baseline_inefficiency.json \
+  --candidate-json docs/reports/optimizations/debug/latest_inefficiency.json \
+  --out-dir docs/reports/optimizations/debug
+```
+
+Writes:
+
+- `latest_inefficiency_diff.json`
+- `latest_inefficiency_diff.md`
+
+Key fields:
+
+- `cycle_delta`
+- `headroom_delta`
+- per-segment cycle/headroom deltas
+- scratch hotspot deltas (`tight_delta`, `near_strict_delta`, `dep_edges_delta`)
 
 ## Run With Custom Kernel Config
 
