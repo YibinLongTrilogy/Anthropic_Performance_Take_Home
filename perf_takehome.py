@@ -281,7 +281,7 @@ class KernelBuilder:
         scheduler_engine_bias: dict[str, int] | None = None,
         split_hash_pairs: bool = True,
         scheduler_succ_weight: int = 3584,
-        scheduler_random_seed: int | None = 523,
+        scheduler_random_seed: int | None = 707,
         scheduler_multi_start_seeds: tuple[int, ...] | list[int] | None = None,
         scheduler_beam_width: int = 1,
         fast_value_vector_ptrs: bool = True,
