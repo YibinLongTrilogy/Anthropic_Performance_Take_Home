@@ -4,6 +4,7 @@
 
 ## Latest Handoff
 
+- 2026-02-11 (1381-cycle update): `docs/OPTIMIZATION_CONTINUATION_HANDOFF_2026-02-11_1381.md`
 - 2026-02-11 continuation log: `docs/OPTIMIZATION_CONTINUATION_HANDOFF_2026-02-11.md`
 - Read this first for the newest experiment outcomes, failed attempts, and next-step recommendations.
 
@@ -46,17 +47,15 @@ We are optimizing a **VLIW SIMD kernel** that performs parallel tree traversal o
 
 | Metric | Value |
 |--------|-------|
-| **Cycle count** | **1407** |
-| **Speedup** | **104.999x** over baseline |
+| **Cycle count** | **1381** |
+| **Speedup** | **106.976x** over baseline |
 | **Tests passing** | **8/9** |
-| **Only failing test** | `test_opus45_improved_harness` (requires < 1363, need 44 more cycles) |
+| **Only failing test** | `test_opus45_improved_harness` (requires < 1363, need 18 more cycles) |
 
-**Current bottlenecks (from diagnostics):**
-- `valu`: **94.4%** utilization (near saturation)
-- `load`: **92.4%** utilization (near saturation)
-- `flow`: active on **24.3%** of cycles
-- `alu`: near-zero utilization in current run (~0%), mostly idle
-- `store`: low utilization
+**Current bottlenecks (from latest diagnostics):**
+- `strict_dep_wait`: dominant blocker (`7,467,908`)
+- `engine_full`: secondary blocker (`128,810`)
+- estimated schedule headroom: `53` cycles (lower bound `1328` vs measured `1381`)
 
 ---
 
