@@ -16,7 +16,7 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
@@ -285,6 +285,7 @@ class KernelBuilder:
         scheduler_multi_start_seeds: tuple[int, ...] | list[int] | None = None,
         scheduler_beam_width: int = 1,
         fast_value_vector_ptrs: bool = True,
+        scheduler_decision_trace: bool = False,
     ):
         self.instrs = []
         self.scratch = {}
@@ -317,6 +318,7 @@ class KernelBuilder:
         )
         self.scheduler_beam_width = max(1, int(scheduler_beam_width))
         self.fast_value_vector_ptrs = fast_value_vector_ptrs
+        self.scheduler_decision_trace = bool(scheduler_decision_trace)
         self._schedule_segments = []
 
     def debug_info(self):
@@ -573,6 +575,7 @@ class KernelBuilder:
         instrs = []
         cycle_engine_counts = []
         scheduled_cycle = [-1] * n_ops
+        decision_trace: list[dict[str, object]] = []
         cycle = 0
         remaining = n_ops
 
@@ -581,6 +584,16 @@ class KernelBuilder:
             engine_counts = defaultdict(int)
             deferred = []
             scheduled_any = False
+            trace_row = {
+                "cycle": cycle,
+                "ready_heap_start": len(ready_heap),
+                "sample_batches": 0,
+                "sampled_ops": 0,
+                "scheduled_ops": [],
+                "rejections": Counter(),
+                "feasible_not_chosen": 0,
+                "feasible_not_chosen_ops": [],
+            }
 
             while ready_heap:
                 # Limited lookahead: score a small frontier of ready ops and choose
@@ -592,19 +605,30 @@ class KernelBuilder:
                         break
                     sampled.append(heapq.heappop(ready_heap))
 
+                trace_row["sample_batches"] += 1
+                trace_row["sampled_ops"] += len(sampled)
+
                 feasible = []
                 for _, i in sampled:
                     if scheduled[i]:
+                        trace_row["rejections"]["already_scheduled"] += 1
                         continue
                     if max_strict_pred_cycle[i] + 1 > cycle:
                         deferred.append((-op_priority[i], i))
+                        trace_row["rejections"]["strict_dep_wait"] += 1
                         continue
                     if max_weak_pred_cycle[i] > cycle:
                         deferred.append((-op_priority[i], i))
+                        trace_row["rejections"]["weak_dep_wait"] += 1
                         continue
                     engine, _, _, _, slot_count = ops[i]
                     if engine_counts[engine] + slot_count > SLOT_LIMITS[engine]:
                         deferred.append((-op_priority[i], i))
+                        free_slots = SLOT_LIMITS[engine] - engine_counts[engine]
+                        if free_slots <= 0:
+                            trace_row["rejections"]["engine_full"] += 1
+                        else:
+                            trace_row["rejections"]["slot_fragmentation"] += 1
                         continue
                     feasible.append(i)
 
@@ -625,6 +649,20 @@ class KernelBuilder:
                 for _, idx in sampled:
                     if idx != i and not scheduled[idx]:
                         deferred.append((-op_priority[idx], idx))
+                        if idx in feasible:
+                            trace_row["feasible_not_chosen"] += 1
+                            if len(trace_row["feasible_not_chosen_ops"]) < 12:
+                                trace_row["feasible_not_chosen_ops"].append(
+                                    {
+                                        "op_id": idx,
+                                        "engine": ops[idx][0],
+                                        "slot_count": ops[idx][4],
+                                        "priority": op_priority[idx],
+                                        "crit_path": crit_path[idx],
+                                        "succ_count": succ_count[idx],
+                                    }
+                                )
+                            trace_row["rejections"]["beam_choice"] += 1
 
                 engine, slot_list, _, _, slot_count = ops[i]
 
@@ -632,6 +670,17 @@ class KernelBuilder:
                 scheduled[i] = True
                 scheduled_cycle[i] = cycle
                 remaining -= 1
+
+                trace_row["scheduled_ops"].append(
+                    {
+                        "op_id": i,
+                        "engine": engine,
+                        "slot_count": slot_count,
+                        "priority": op_priority[i],
+                        "crit_path": crit_path[i],
+                        "succ_count": succ_count[i],
+                    }
+                )
 
                 engine_counts[engine] += slot_count
                 bundle.setdefault(engine, []).extend(slot_list)
@@ -655,6 +704,17 @@ class KernelBuilder:
 
             instrs.append(bundle)
             cycle_engine_counts.append(dict(engine_counts))
+            if self.scheduler_decision_trace:
+                trace_row["used_slots"] = {
+                    engine: int(engine_counts.get(engine, 0))
+                    for engine in SLOT_LIMITS
+                    if engine != "debug"
+                }
+                trace_row["deferred_queue_size_end"] = len(deferred)
+                trace_row["rejections"] = dict(
+                    sorted(trace_row["rejections"].items(), key=lambda kv: (-kv[1], kv[0]))
+                )
+                decision_trace.append(trace_row)
             cycle += 1
 
             if deferred:
@@ -664,7 +724,7 @@ class KernelBuilder:
                 ready_heap = []
 
         profile_segment = None
-        if self.scheduler_profile_enabled:
+        if self.scheduler_profile_enabled or self.scheduler_decision_trace:
             ops_meta = []
             for i, (engine, slot_list, reads, writes, slot_count) in enumerate(ops):
                 ops_meta.append(
@@ -672,6 +732,7 @@ class KernelBuilder:
                         "op_id": i,
                         "engine": engine,
                         "slot_count": slot_count,
+                        "opcodes": [slot[0] if slot else "unknown" for slot in slot_list],
                         "reads": sorted(reads),
                         "writes": sorted(writes),
                         "crit_path": crit_path[i],
@@ -686,6 +747,8 @@ class KernelBuilder:
                 "scheduler_seed": random_seed,
                 "scheduler_beam_width": self.scheduler_beam_width,
             }
+            if self.scheduler_decision_trace:
+                profile_segment["decision_trace"] = decision_trace
 
         return instrs, profile_segment
 
@@ -718,7 +781,7 @@ class KernelBuilder:
                 best_instrs = instrs
                 best_profile = profile
 
-        if self.scheduler_profile_enabled and best_profile is not None:
+        if (self.scheduler_profile_enabled or self.scheduler_decision_trace) and best_profile is not None:
             best_profile["scheduler_candidates"] = candidate_runs
             self._schedule_segments.append(best_profile)
         return best_instrs or []
