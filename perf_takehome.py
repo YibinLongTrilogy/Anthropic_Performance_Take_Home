@@ -281,9 +281,10 @@ class KernelBuilder:
         scheduler_engine_bias: dict[str, int] | None = None,
         split_hash_pairs: bool = True,
         scheduler_succ_weight: int = 3584,
-        scheduler_random_seed: int | None = 51,
+        scheduler_random_seed: int | None = 523,
         scheduler_multi_start_seeds: tuple[int, ...] | list[int] | None = None,
         scheduler_beam_width: int = 1,
+        fast_value_vector_ptrs: bool = True,
     ):
         self.instrs = []
         self.scratch = {}
@@ -315,6 +316,7 @@ class KernelBuilder:
             else None
         )
         self.scheduler_beam_width = max(1, int(scheduler_beam_width))
+        self.fast_value_vector_ptrs = fast_value_vector_ptrs
         self._schedule_segments = []
 
     def debug_info(self):
@@ -1140,15 +1142,17 @@ class KernelBuilder:
         if use_depth3_deterministic:
             vec_depth3_nodes = []
             node_addr = self.alloc_scratch()
+            header.append(
+                ("alu", ("+", node_addr, self.scratch["forest_values_p"], header_scratch_const(7)))
+            )
             for off in range(7, 15):
                 node = self.alloc_scratch(f"node{off}")
-                header.append(
-                    ("alu", ("+", node_addr, self.scratch["forest_values_p"], header_scratch_const(off)))
-                )
                 header.append(("load", ("load", node, node_addr)))
                 vec_node = self.alloc_scratch(f"vec_node{off}", VLEN)
                 header.append(("valu", ("vbroadcast", vec_node, node)))
                 vec_depth3_nodes.append(vec_node)
+                if off < 14:
+                    header.append(("alu", ("+", node_addr, node_addr, one_const)))
         else:
             vec_depth3_nodes = []
         if use_depth4_deterministic:
@@ -1234,6 +1238,11 @@ class KernelBuilder:
                     "vec_val_save": self.alloc_scratch(f"vec_val_save_g{g}", VLEN),
                 }
             )
+        vec_depth3_select_tmp = (
+            self.alloc_scratch("vec_depth3_select_tmp", VLEN)
+            if use_depth3_deterministic
+            else None
+        )
 
         vec_count = (batch_size // VLEN) * VLEN
         def emit_vector_group_ops(round, i, regs, depth):
@@ -1357,29 +1366,53 @@ class KernelBuilder:
                     )
                 )
             elif depth == 3 and use_depth3_deterministic:
-                # Depth-3 idx is deterministic in [7, 14]. Replace gather with
-                # compare/select against preloaded node vectors.
-                body.append(("valu", ("-", vec_addr, vec_idx, vec_seven)))
-                # Save path for idx restoration after hash (hash uses vec_addr/temp regs).
+                # Depth-3 idx is deterministic in [7, 14]. Use a balanced
+                # select tree over nodes 7..14 driven by path bits.
+                # path = idx - 7 in [0, 7]
+                body.append(("valu", ("-", vec_val_save, vec_idx, vec_seven)))
+                # b1 = path & 2 (used for both subtree merges)
+                body.append(("valu", ("&", vec_node_val, vec_val_save, vec_two)))
+                # Lower subtree over nodes 7..10 using b0
+                body.append(("valu", ("&", vec_addr, vec_val_save, vec_one)))
                 body.append(
-                    ("flow", ("vselect", vec_val_save, vec_one, vec_addr, vec_addr))
-                )
-                # node_val starts at node7; then overwrite for path 1..7 matches.
-                body.append(
-                    ("flow", ("vselect", vec_node_val, vec_one, vec_depth3_nodes[0], vec_depth3_nodes[0]))
+                    ("flow", ("vselect", vec_idx, vec_addr, vec_depth3_nodes[1], vec_depth3_nodes[0]))
                 )
                 body.append(
-                    ("flow", ("vselect", vec_idx, vec_one, vec_one, vec_one))
+                    ("flow", ("vselect", vec_addr, vec_addr, vec_depth3_nodes[3], vec_depth3_nodes[2]))
                 )
-                for path_i, vec_node in enumerate(vec_depth3_nodes[1:]):
-                    body.append(
-                        ("valu", ("==", vec_addr, vec_val_save, vec_idx))
+                body.append(("flow", ("vselect", vec_idx, vec_node_val, vec_addr, vec_idx)))
+                # Upper subtree over nodes 11..14 using b0 and then b1
+                body.append(("valu", ("&", vec_addr, vec_val_save, vec_one)))
+                body.append(
+                    (
+                        "flow",
+                        (
+                            "vselect",
+                            vec_depth3_select_tmp,
+                            vec_addr,
+                            vec_depth3_nodes[7],
+                            vec_depth3_nodes[6],
+                        ),
                     )
-                    body.append(
-                        ("flow", ("vselect", vec_node_val, vec_addr, vec_node, vec_node_val))
+                )
+                body.append(
+                    ("flow", ("vselect", vec_addr, vec_addr, vec_depth3_nodes[5], vec_depth3_nodes[4]))
+                )
+                body.append(
+                    (
+                        "flow",
+                        (
+                            "vselect",
+                            vec_addr,
+                            vec_node_val,
+                            vec_depth3_select_tmp,
+                            vec_addr,
+                        ),
                     )
-                    if path_i < len(vec_depth3_nodes[1:]) - 1:
-                        body.append(("valu", ("+", vec_idx, vec_idx, vec_one)))
+                )
+                # b2 = path >> 2 in {0,1}; choose upper vs lower subtree.
+                body.append(("valu", (">>", vec_node_val, vec_val_save, vec_two)))
+                body.append(("flow", ("vselect", vec_node_val, vec_node_val, vec_addr, vec_idx)))
                 body.append(
                     (
                         "debug",
@@ -1397,7 +1430,7 @@ class KernelBuilder:
                         vec_val, vec_tmp1, vec_tmp2, round, i, vec_const_map
                     )
                 )
-                # Restore full idx from saved path.
+                # Restore full idx from saved path for shared idx update logic.
                 body.append(("valu", ("+", vec_idx, vec_val_save, vec_seven)))
             elif depth == 4 and use_depth4_deterministic:
                 # Depth-4 idx is deterministic in [15, 30]. Use a submission-only
@@ -1581,22 +1614,43 @@ class KernelBuilder:
                 offset_addrs[off] = self.const_map[off]
                 body.append(("load", ("const", offset_addrs[off], off)))
 
-        for base in range(0, vec_count, VLEN):
-            if use_idx_mem:
+        use_fast_value_vector_ptrs = (
+            self.fast_value_vector_ptrs
+            and zero_base is not None
+            and not use_idx_mem
+            and vec_count > 0
+        )
+        vec_stride_const = None
+        val_load_ptr = None
+        if use_fast_value_vector_ptrs:
+            if VLEN not in self.const_map:
+                addr = self.alloc_scratch()
+                self.const_map[VLEN] = addr
+                body.append(("flow", ("add_imm", addr, zero_base, VLEN)))
+            vec_stride_const = self.const_map[VLEN]
+            val_load_ptr = self.alloc_scratch("val_load_ptr")
+            body.append(("alu", ("+", val_load_ptr, self.scratch["inp_values_p"], zero_const)))
+            for base in range(0, vec_count, VLEN):
+                body.append(("load", ("vload", val_arr + base, val_load_ptr)))
+                if base + VLEN < vec_count:
+                    body.append(("alu", ("+", val_load_ptr, val_load_ptr, vec_stride_const)))
+        else:
+            for base in range(0, vec_count, VLEN):
+                if use_idx_mem:
+                    if zero_base is not None:
+                        body.append(("flow", ("add_imm", tmp_addr, self.scratch["inp_indices_p"], base)))
+                    else:
+                        body.append(
+                            ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], offset_addrs[base]))
+                        )
+                    body.append(("load", ("vload", idx_arr + base, tmp_addr)))
                 if zero_base is not None:
-                    body.append(("flow", ("add_imm", tmp_addr, self.scratch["inp_indices_p"], base)))
+                    body.append(("flow", ("add_imm", tmp_addr_b, self.scratch["inp_values_p"], base)))
                 else:
                     body.append(
-                        ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], offset_addrs[base]))
+                        ("alu", ("+", tmp_addr_b, self.scratch["inp_values_p"], offset_addrs[base]))
                     )
-                body.append(("load", ("vload", idx_arr + base, tmp_addr)))
-            if zero_base is not None:
-                body.append(("flow", ("add_imm", tmp_addr_b, self.scratch["inp_values_p"], base)))
-            else:
-                body.append(
-                    ("alu", ("+", tmp_addr_b, self.scratch["inp_values_p"], offset_addrs[base]))
-                )
-            body.append(("load", ("vload", val_arr + base, tmp_addr_b)))
+                body.append(("load", ("vload", val_arr + base, tmp_addr_b)))
 
         for i in range(vec_count, batch_size):
             if use_idx_mem:
